@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import boto3
 from fastapi import FastAPI, BackgroundTasks, HTTPException
@@ -21,11 +20,11 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# S3 Configuration - IMPORTANT: Never hardcode credentials!
+# S3 Configuration
 S3_BUCKET = os.getenv('S3_BUCKET')
-S3_PREFIX = os.getenv('S3_PREFIX', 'model-weights/')
-AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')  # Changed from hardcoded value
-AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')  # Changed from hardcoded value
+S3_PREFIX = os.getenv('S3_PREFIX', 'model/')
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 
 # Initialize S3 client
 s3 = boto3.client(
@@ -34,7 +33,7 @@ s3 = boto3.client(
     aws_secret_access_key=AWS_SECRET_KEY
 )
 
-# Initialize model and tokenizer as None (will be loaded later)
+# Initialize model and tokenizer
 model = None
 tokenizer = None
 
@@ -44,9 +43,15 @@ class S3Dataset(Dataset):
         self.max_length = max_length
         self.examples = []
         
-        # Stream directly from S3
+        transport_params = {
+            'session': boto3.Session(
+                aws_access_key_id=AWS_ACCESS_KEY,
+                aws_secret_access_key=AWS_SECRET_KEY
+            )
+        }
+        
         try:
-            with smart_open.open(s3_uri, 'r', encoding='utf-8') as f:
+            with smart_open.open(s3_uri, 'r', encoding='utf-8', transport_params=transport_params) as f:
                 for line in f:
                     try:
                         data = json.loads(line)
@@ -81,7 +86,7 @@ class S3Dataset(Dataset):
 def upload_to_s3(local_path, s3_key):
     try:
         s3.upload_file(local_path, S3_BUCKET, s3_key)
-        logger.info(f"Successfully uploaded {local_path} to s3://{S3_BUCKET}/{s3_key}")
+        logger.info(f"Uploaded {local_path} to s3://{S3_BUCKET}/{s3_key}")
         return True
     except Exception as e:
         logger.error(f"Failed to upload to S3: {e}")
@@ -90,7 +95,7 @@ def upload_to_s3(local_path, s3_key):
 def download_from_s3(s3_key, local_path):
     try:
         s3.download_file(S3_BUCKET, s3_key, local_path)
-        logger.info(f"Successfully downloaded s3://{S3_BUCKET}/{s3_key} to {local_path}")
+        logger.info(f"Downloaded s3://{S3_BUCKET}/{s3_key} to {local_path}")
         return True
     except Exception as e:
         logger.error(f"Failed to download from S3: {e}")
@@ -107,30 +112,33 @@ class GenerateRequest(BaseModel):
     temperature: float = 0.7
 
 @app.on_event("startup")
-async def startup_event():
-    """Load model when starting the application"""
+def startup_event():
+    """Load model on startup"""
     global model, tokenizer
     try:
-        # Check if model files exist locally, if not download from S3
         os.makedirs("./model", exist_ok=True)
         
-        if not os.path.exists("./model/model.safetensors"):
-            download_from_s3(f"{S3_PREFIX}model.safetensors", "./model/model.safetensors")
+        # List and download all model files from S3
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PREFIX)
+        if 'Contents' not in response:
+            logger.error("No files found in S3 bucket.")
+            raise Exception("No model files in S3.")
         
-        if not os.path.exists("./model/tokenizer.json"):
-            download_from_s3(f"{S3_PREFIX}tokenizer.json", "./model/tokenizer.json")
+        for obj in response['Contents']:
+            s3_key = obj['Key']
+            local_path = os.path.join("./model", os.path.relpath(s3_key, S3_PREFIX))
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            if not download_from_s3(s3_key, local_path):
+                raise Exception(f"Failed to download {s3_key}")
         
         # Load tokenizer and model
         tokenizer = GPT2Tokenizer.from_pretrained("./model")
-        model = GPT2LMHeadModel.from_pretrained('gpt2')
-        
-        # Load the fine-tuned weights
-        model.load_state_dict(torch.load("./model/model.safetensors"))
+        model = GPT2LMHeadModel.from_pretrained("./model")
         model.eval()
-        
         logger.info("Model and tokenizer loaded successfully")
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
+        logger.error(f"Startup failed: {e}")
+        raise
 
 @app.post("/start-training")
 async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
@@ -139,23 +147,22 @@ async def start_training(request: TrainingRequest, background_tasks: BackgroundT
     return {"status": "training_started", "message": "Training started in the background"}
 
 def run_training(params):
-    """Run the training process"""
+    """Run training and upload model to S3"""
     global model, tokenizer
     try:
-        logger.info("Starting training process")
+        logger.info("Initializing training...")
         
-        # Initialize tokenizer and model
+        # Load tokenizer and model
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         tokenizer.add_special_tokens({'pad_token': '[PAD]', 'sep_token': '[SEP]'})
-        
         model = GPT2LMHeadModel.from_pretrained('gpt2')
         model.resize_token_embeddings(len(tokenizer))
 
-        # Stream dataset from S3
+        # Load dataset from S3
         dataset_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}conversation_dataset.jsonl"
         dataset = S3Dataset(dataset_uri, tokenizer)
 
-        # Training with checkpointing to S3
+        # Training arguments
         training_args = TrainingArguments(
             output_dir="./output",
             num_train_epochs=params['epochs'],
@@ -170,48 +177,50 @@ def run_training(params):
             report_to=None
         )
 
+        # Initialize Trainer
         trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=dataset,
         )
 
-        logger.info("Starting model training")
+        # Train and save
+        logger.info("Training model...")
         trainer.train()
-        logger.info("Training completed successfully")
-
-        # Save model parts to S3
-        model_path = "./output/model.safetensors"
-        torch.save(model.state_dict(), model_path)
-        upload_to_s3(model_path, f"{S3_PREFIX}model.safetensors")
-
-        tokenizer.save_pretrained("./output")
-        upload_to_s3("./output/tokenizer.json", f"{S3_PREFIX}tokenizer.json")
-
-        logger.info("Model artifacts uploaded to S3 successfully")
         
-        # Reload the model for inference
+        # Save model and tokenizer
+        output_dir = "./output"
+        model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+        
+        # Upload all files to S3
+        for file_name in os.listdir(output_dir):
+            local_path = os.path.join(output_dir, file_name)
+            s3_key = f"{S3_PREFIX}{file_name}"
+            upload_to_s3(local_path, s3_key)
+        
+        logger.info("Model updated and uploaded to S3")
+        
+        # Reload model
         startup_event()
-
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        raise
 
 @app.get("/load-model")
 async def load_model():
-    """Explicitly load or reload the model"""
-    global model, tokenizer
+    """Manually reload the model from S3"""
     try:
         startup_event()
-        return {"status": "success", "message": "Model loaded successfully"}
+        return {"status": "success", "message": "Model reloaded"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @app.post("/generate-reply")
 async def generate_reply(request: GenerateRequest):
-    """Generate a reply using the fine-tuned model"""
+    """Generate a reply using the model"""
     global model, tokenizer
-    
-    if not model or not tokenizer:
+    if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
@@ -222,34 +231,26 @@ async def generate_reply(request: GenerateRequest):
             max_length=512
         )
         
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids,
-                max_length=request.max_length,
-                temperature=request.temperature,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                no_repeat_ngram_size=2
-            )
+        outputs = model.generate(
+            inputs.input_ids,
+            max_length=request.max_length,
+            temperature=request.temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            no_repeat_ngram_size=2
+        )
         
         reply = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Clean up the response
         reply = reply.replace(request.prompt, "").strip()
-        reply = reply.split('\n')[0]  # Take only the first line
+        reply = reply.split('\n')[0]
         
-        return {
-            "status": "success",
-            "reply": reply,
-            "prompt": request.prompt
-        }
+        return {"status": "success", "reply": reply}
     except Exception as e:
-        logger.error(f"Error generating reply: {e}")
+        logger.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "ok",
         "model_loaded": model is not None,
