@@ -2,10 +2,13 @@ fastapi==0.95.2
 uvicorn==0.22.0
 transformers==4.31.0
 torch==2.0.1
-datasets==2.13.1
 boto3==1.26.142
 python-dotenv==1.0.0
 pydantic==1.10.7
+smart-open==6.3.0
+datasets==2.13.1
+evaluate==0.4.0
 accelerate==0.21.0
 tqdm==4.65.0
-smart_open
+sentencepiece==0.1.99  # Required for some tokenizers
+protobuf==3.20.3  # Required dependency for transformers
