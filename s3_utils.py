@@ -9,8 +9,8 @@ class S3Manager:
     def __init__(self):
         self.s3 = boto3.client(
             's3',
-            aws_access_key_id=Config.AWS_ACCESS_KEY,
-            aws_secret_access_key=Config.AWS_SECRET_KEY
+            aws_access_key_id=Config.AKIA5GU2673EBGPIRSFW ,
+            aws_secret_access_key=Config.6u3E93qvJft/Q4UV41soVsVgK8uGdHoL7e0/BeTx
         )
     
     def download_model(self):
