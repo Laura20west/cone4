@@ -159,7 +159,7 @@ def run_training(params):
         model.resize_token_embeddings(len(tokenizer))
 
         # Load dataset from S3
-        dataset_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}conversation_dataset.jsonl"
+        dataset_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}conversation_dataset.json"
         dataset = S3Dataset(dataset_uri, tokenizer)
 
         # Training arguments
