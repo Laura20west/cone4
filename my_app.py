@@ -1,76 +1,84 @@
-import os
-import json
-import boto3
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, Trainer, TrainingArguments
-import torch
 from torch.utils.data import Dataset
+import torch
+import json
+from pathlib import Path
 import logging
-from dotenv import load_dotenv
-import smart_open
+from typing import List, Optional
+import os
 
-# Load environment variables
-load_dotenv()
-
-# Initialize FastAPI
 app = FastAPI()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# S3 Configuration
-S3_BUCKET = os.getenv('S3_BUCKET')
-S3_PREFIX = os.getenv('S3_PREFIX', 'model/')
-AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
-AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-
-# Initialize S3 client
-s3 = boto3.client(
-    's3',
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
 
-# Initialize model and tokenizer
-model = None
-tokenizer = None
+# Configuration
+DATASET_PATH = "conversation_dataset.jsonl"
+MODEL_DIR = "fine_tuned_gpt2"
+BASE_MODEL = "gpt2"
 
-class S3Dataset(Dataset):
-    def __init__(self, s3_uri, tokenizer, max_length=128):
+# Load model and tokenizer
+try:
+    tokenizer = GPT2Tokenizer.from_pretrained(
+        MODEL_DIR if os.path.exists(MODEL_DIR) else BASE_MODEL
+    )
+    tokenizer.add_special_tokens({
+        'pad_token': '[PAD]',
+        'sep_token': '[SEP]',
+        'eos_token': '[EOS]'
+    })
+    
+    model = GPT2LMHeadModel.from_pretrained(
+        MODEL_DIR if os.path.exists(MODEL_DIR) else BASE_MODEL
+    )
+    model.resize_token_embeddings(len(tokenizer))
+    model.eval()
+except Exception as e:
+    logging.error(f"Failed to load model: {e}")
+    raise
+
+class TrainingRequest(BaseModel):
+    epochs: int = 3
+    batch_size: int = 4
+    learning_rate: float = 5e-5
+    overwrite: bool = False
+
+class ConversationExample(BaseModel):
+    context: str
+    response: str
+
+class ConversationDataset(Dataset):
+    def __init__(self, file_path: str, tokenizer, max_length: int = 128):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.examples = []
         
-        transport_params = {
-            'session': boto3.Session(
-                aws_access_key_id=AWS_ACCESS_KEY,
-                aws_secret_access_key=AWS_SECRET_KEY
-            )
-        }
-        
         try:
-            with smart_open.open(s3_uri, 'r', encoding='utf-8', transport_params=transport_params) as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    try:
-                        data = json.loads(line)
-                        self.examples.append({
-                            'context': data.get('context', ''),
-                            'response': data['response']
-                        })
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse line: {line}. Error: {e}")
+                    data = json.loads(line)
+                    self.examples.append({
+                        'context': data.get('context', ''),
+                        'response': data['response']
+                    })
+            logging.info(f"Loaded {len(self.examples)} examples from {file_path}")
         except Exception as e:
-            logger.error(f"Error loading dataset from S3: {e}")
+            logging.error(f"Failed to load dataset: {e}")
             raise
-
+&& python -m spacy download en_core_web_md && python -m nltk.downloader wordne
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
         text = f"{self.examples[idx]['context']} [SEP] {self.examples[idx]['response']}"
-        inputs = self.tokenizer(
+        tokenized = self.tokenizer(
             text,
             max_length=self.max_length,
             padding='max_length',
@@ -78,103 +86,51 @@ class S3Dataset(Dataset):
             return_tensors="pt"
         )
         return {
-            'input_ids': inputs['input_ids'].squeeze(),
-            'attention_mask': inputs['attention_mask'].squeeze(),
-            'labels': inputs['input_ids'].squeeze()
+            'input_ids': tokenized['input_ids'].squeeze(),
+            'attention_mask': tokenized['attention_mask'].squeeze(),
+            'labels': tokenized['input_ids'].squeeze()
         }
 
-def upload_to_s3(local_path, s3_key):
+@app.get("/dataset", response_model=List[ConversationExample])
+async def get_dataset(limit: int = 10):
+    """Endpoint to view the training dataset"""
     try:
-        s3.upload_file(local_path, S3_BUCKET, s3_key)
-        logger.info(f"Uploaded {local_path} to s3://{S3_BUCKET}/{s3_key}")
-        return True
+        examples = []
+        with open(DATASET_PATH, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                if i >= limit:
+                    break
+                data = json.loads(line)
+                examples.append(ConversationExample(**data))
+        return examples
     except Exception as e:
-        logger.error(f"Failed to upload to S3: {e}")
-        return False
+        raise HTTPException(status_code=500, detail=str(e))
 
-def download_from_s3(s3_key, local_path):
+@app.post("/train-model")
+async def train_model(request: TrainingRequest):
+    """Endpoint to trigger model training"""
     try:
-        s3.download_file(S3_BUCKET, s3_key, local_path)
-        logger.info(f"Downloaded s3://{S3_BUCKET}/{s3_key} to {local_path}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to download from S3: {e}")
-        return False
+        # Check if model exists and overwrite flag
+        if os.path.exists(MODEL_DIR) and not request.overwrite:
+            return JSONResponse(
+                status_code=400,
+                content={"message": "Model already exists. Set overwrite=True to retrain."}
+            )
 
-class TrainingRequest(BaseModel):
-    epochs: int = 1
-    batch_size: int = 1
-    learning_rate: float = 5e-5
-
-class GenerateRequest(BaseModel):
-    prompt: str
-    max_length: int = 100
-    temperature: float = 0.7
-
-@app.on_event("startup")
-def startup_event():
-    """Load model on startup"""
-    global model, tokenizer
-    try:
-        os.makedirs("./model", exist_ok=True)
+        # Load dataset
+        dataset = ConversationDataset(DATASET_PATH, tokenizer)
         
-        # List and download all model files from S3
-        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=S3_PREFIX)
-        if 'Contents' not in response:
-            logger.error("No files found in S3 bucket.")
-            raise Exception("No model files in S3.")
-        
-        for obj in response['Contents']:
-            s3_key = obj['Key']
-            local_path = os.path.join("./model", os.path.relpath(s3_key, S3_PREFIX))
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
-            if not download_from_s3(s3_key, local_path):
-                raise Exception(f"Failed to download {s3_key}")
-        
-        # Load tokenizer and model
-        tokenizer = GPT2Tokenizer.from_pretrained("./model")
-        model = GPT2LMHeadModel.from_pretrained("./model")
-        model.eval()
-        logger.info("Model and tokenizer loaded successfully")
-    except Exception as e:
-        logger.error(f"Startup failed: {e}")
-        raise
-
-@app.post("/start-training")
-async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
-    """Start training as a background task"""
-    background_tasks.add_task(run_training, request.dict())
-    return {"status": "training_started", "message": "Training started in the background"}
-
-def run_training(params):
-    """Run training and upload model to S3"""
-    global model, tokenizer
-    try:
-        logger.info("Initializing training...")
-        
-        # Load tokenizer and model
-        tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        tokenizer.add_special_tokens({'pad_token': '[PAD]', 'sep_token': '[SEP]'})
-        model = GPT2LMHeadModel.from_pretrained('gpt2')
-        model.resize_token_embeddings(len(tokenizer))
-
-        # Load dataset from S3
-        dataset_uri = f"s3://{S3_BUCKET}/{S3_PREFIX}conversation_dataset.json"
-        dataset = S3Dataset(dataset_uri, tokenizer)
-
         # Training arguments
         training_args = TrainingArguments(
-            output_dir="./output",
-            num_train_epochs=params['epochs'],
-            per_device_train_batch_size=params['batch_size'],
-            learning_rate=params['learning_rate'],
-            save_strategy="steps",
-            save_steps=100,
+            output_dir='./training_results',
+            num_train_epochs=request.epochs,
+            per_device_train_batch_size=request.batch_size,
+            learning_rate=request.learning_rate,
+            save_steps=500,
             save_total_limit=2,
-            gradient_accumulation_steps=4,
-            fp16=torch.cuda.is_available(),
-            logging_steps=10,
-            report_to=None
+            logging_steps=100,
+            report_to=None,
+            no_cuda=not torch.cuda.is_available()
         )
 
         # Initialize Trainer
@@ -185,77 +141,40 @@ def run_training(params):
         )
 
         # Train and save
-        logger.info("Training model...")
         trainer.train()
-        
-        # Save model and tokenizer
-        output_dir = "./output"
-        model.save_pretrained(output_dir)
-        tokenizer.save_pretrained(output_dir)
-        
-        # Upload all files to S3
-        for file_name in os.listdir(output_dir):
-            local_path = os.path.join(output_dir, file_name)
-            s3_key = f"{S3_PREFIX}{file_name}"
-            upload_to_s3(local_path, s3_key)
-        
-        logger.info("Model updated and uploaded to S3")
-        
-        # Reload model
-        startup_event()
-    except Exception as e:
-        logger.error(f"Training failed: {e}")
-        raise
+        trainer.save_model(MODEL_DIR)
+        tokenizer.save_pretrained(MODEL_DIR)
 
-@app.get("/load-model")
-async def load_model():
-    """Manually reload the model from S3"""
-    try:
-        startup_event()
-        return {"status": "success", "message": "Model reloaded"}
+        return {"message": "Training completed successfully!"}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate-reply")
-async def generate_reply(request: GenerateRequest):
-    """Generate a reply using the model"""
-    global model, tokenizer
-    if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
+@app.post("/generate")
+async def generate_response(context: str, max_length: int = 100):
+    """Generate a response given a context"""
     try:
-        inputs = tokenizer(
-            request.prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512
+        input_text = f"{context} [SEP]"
+        input_ids = tokenizer.encode(input_text, return_tensors='pt')
+        
+        output = model.generate(
+            input_ids,
+            max_length=max_length,
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            early_stopping=True,
+            pad_token_id=tokenizer.eos_token_id
         )
         
-        outputs = model.generate(
-            inputs.input_ids,
-            max_length=request.max_length,
-            temperature=request.temperature,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-            no_repeat_ngram_size=2
-        )
+        full_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        response = full_text.split('[SEP]')[-1].strip()
         
-        reply = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        reply = reply.replace(request.prompt, "").strip()
-        reply = reply.split('\n')[0]
-        
-        return {"status": "success", "reply": reply}
+        return {"response": response}
     except Exception as e:
-        logger.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "ok",
-        "model_loaded": model is not None,
-        "tokenizer_loaded": tokenizer is not None
-    }
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
